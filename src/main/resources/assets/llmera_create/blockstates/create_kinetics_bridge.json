@@ -1,0 +1,10 @@
+{
+  "variants": {
+    "facing=down": { "model": "llmera_create:block/create_kinetics_bridge" },
+    "facing=up": { "model": "llmera_create:block/create_kinetics_bridge" },
+    "facing=north": { "model": "llmera_create:block/create_kinetics_bridge" },
+    "facing=south": { "model": "llmera_create:block/create_kinetics_bridge" },
+    "facing=west": { "model": "llmera_create:block/create_kinetics_bridge" },
+    "facing=east": { "model": "llmera_create:block/create_kinetics_bridge" }
+  }
+}

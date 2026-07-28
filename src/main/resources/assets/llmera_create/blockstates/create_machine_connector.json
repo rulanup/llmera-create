@@ -1,0 +1,5 @@
+{
+  "variants": {
+    "": { "model": "llmera_create:block/create_machine_connector" }
+  }
+}

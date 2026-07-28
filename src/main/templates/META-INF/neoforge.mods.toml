@@ -1,0 +1,44 @@
+modLoader="javafml"
+loaderVersion="${loader_version_range}"
+license="All Rights Reserved"
+
+[[mods]]
+modId="llmera_create"
+version="${mod_version}"
+displayName="LLM Era Create Integration"
+description='''Create kinetics diagnostics, recipe lookup, and machine control tools for LLM Era.'''
+
+[[dependencies.llmera_create]]
+modId="neoforge"
+type="required"
+versionRange="[${neo_version},)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.llmera_create]]
+modId="minecraft"
+type="required"
+versionRange="${minecraft_version_range}"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.llmera_create]]
+modId="llmera"
+type="required"
+versionRange="[${mod_version},)"
+ordering="AFTER"
+side="BOTH"
+
+[[dependencies.llmera_create]]
+modId="create"
+type="required"
+versionRange="[6.0,6.1)"
+ordering="AFTER"
+side="BOTH"
+
+[[dependencies.llmera_create]]
+modId="jade"
+type="optional"
+versionRange="[15.10.5,16)"
+ordering="AFTER"
+side="BOTH"

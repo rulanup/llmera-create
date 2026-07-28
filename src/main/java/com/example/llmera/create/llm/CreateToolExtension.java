@@ -64,6 +64,11 @@ public final class CreateToolExtension {
                     Map.entry("target_x", coordinate("crafter x")), Map.entry("target_y", coordinate("crafter y")), Map.entry("target_z", coordinate("crafter z")),
                     Map.entry("item_id", Map.of("type", "string", "description", "optional: specific item to take (e.g. 'minecraft:iron_ingot'). If omitted, takes first available item")),
                     Map.entry("amount", Map.of("type", "integer", "description", "optional: number of items to transfer, default 1"))));
+    private static final ToolDefinition CRAFTER_DIAGNOSTICS = new ToolDefinition(
+            "create_crafter_diagnostics",
+            "Read a Mechanical Crafter's state: current phase, inventory, connected chain, crafting grid, and whether a recipe is ready. Use to check if crafting succeeded.",
+            Map.ofEntries(
+                    Map.entry("x", coordinate("crafter x")), Map.entry("y", coordinate("crafter y")), Map.entry("z", coordinate("crafter z"))));
 
     private static final String GUIDANCE = """
             Create integration tools:
@@ -71,6 +76,7 @@ public final class CreateToolExtension {
               - Use create_machine_diagnostics for detailed machine state including goggle-style information.
               - Use create_recipe_lookup for Create recipe types (crushing, milling, mixing, pressing, cutting, splashing, haunting, filling, emptying, deploying, sandpaper_polishing, compacting, mechanical_crafting).
               - Use create_crafter_load to transfer items from containers (chests, barrels) into Mechanical Crafters for mechanical crafting. Supply source container and target crafter coordinates.
+              - Use create_crafter_diagnostics to check a Mechanical Crafter's phase (IDLE, ACCEPTING, ASSEMBLING, EXPORTING, WAITING, CRAFTING, INSERTING), inventory, crafting grid, chain info, and recipe result.
               - A powered machine connector can expose up to 16 linked Create machines. Supply target_x, target_y, and target_z when more than one machine is available.
             """;
 
@@ -82,7 +88,8 @@ public final class CreateToolExtension {
                 new ToolExtension.Tool(KINETICS_DIAGNOSTICS, Set.of(LlmToolMode.BUILD, LlmToolMode.PLAN), CreateToolExtension::execute),
                 new ToolExtension.Tool(MACHINE_DIAGNOSTICS, Set.of(LlmToolMode.BUILD, LlmToolMode.PLAN), CreateToolExtension::execute),
                 new ToolExtension.Tool(RECIPE_LOOKUP, Set.of(LlmToolMode.BUILD, LlmToolMode.PLAN), CreateToolExtension::execute),
-                new ToolExtension.Tool(CRAFTER_LOAD, Set.of(LlmToolMode.BUILD), CreateToolExtension::execute)
+                new ToolExtension.Tool(CRAFTER_LOAD, Set.of(LlmToolMode.BUILD), CreateToolExtension::execute),
+                new ToolExtension.Tool(CRAFTER_DIAGNOSTICS, Set.of(LlmToolMode.BUILD, LlmToolMode.PLAN), CreateToolExtension::execute)
         ), GUIDANCE);
     }
 
@@ -106,6 +113,7 @@ public final class CreateToolExtension {
             case "create_machine_diagnostics" -> machineDiagnostics(transmitter, invocation);
             case "create_recipe_lookup" -> recipeLookup(transmitter, invocation);
             case "create_crafter_load" -> crafterLoad(transmitter, invocation);
+            case "create_crafter_diagnostics" -> crafterDiagnostics(transmitter, invocation);
             default -> error("unknown Create tool: " + invocation.name());
         };
     }
@@ -343,6 +351,143 @@ public final class CreateToolExtension {
             out.add("item", stackJson(taken));
             out.addProperty("transferred", transferred);
         }
+        return GSON.toJson(out);
+    }
+
+    private static String crafterDiagnostics(IntelligentTransmitterBlockEntity transmitter, ToolInvocation invocation) {
+        if (!(transmitter.getLevel() instanceof ServerLevel level)) return error("transmitter level is not a ServerLevel");
+
+        Integer x = integer(invocation.arguments().get("x"));
+        Integer y = integer(invocation.arguments().get("y"));
+        Integer z = integer(invocation.arguments().get("z"));
+        if (x == null || y == null || z == null) return error("x, y, and z are required");
+        BlockPos crafterPos = new BlockPos(x, y, z);
+
+        if (!level.hasChunkAt(crafterPos)) return error("position is not loaded");
+
+        BlockEntity be = level.getBlockEntity(crafterPos);
+        if (!(be instanceof com.simibubi.create.content.kinetics.crafter.MechanicalCrafterBlockEntity crafter)) {
+            return error("target is not a Mechanical Crafter");
+        }
+
+        JsonObject out = base("create_crafter_diagnostics");
+        out.add("position", position(crafterPos));
+        out.addProperty("block_id", BuiltInRegistries.BLOCK.getKey(crafter.getBlockState().getBlock()).toString());
+
+        // Phase (use reflection since Phase is package-private)
+        String phaseName = "UNKNOWN";
+        try {
+            java.lang.reflect.Field phaseField = com.simibubi.create.content.kinetics.crafter.MechanicalCrafterBlockEntity.class.getDeclaredField("phase");
+            phaseField.setAccessible(true);
+            Object phase = phaseField.get(crafter);
+            if (phase != null) phaseName = phase.toString();
+        } catch (ReflectiveOperationException e) {
+            out.addProperty("phase_error", e.getClass().getSimpleName());
+        }
+        out.addProperty("phase", phaseName);
+
+        // Kinetic state
+        JsonObject kinetics = new JsonObject();
+        kinetics.addProperty("speed", crafter.getSpeed());
+        kinetics.addProperty("over_stressed", crafter.isOverStressed());
+        out.add("kinetics", kinetics);
+
+        // Inventory
+        JsonObject inventory = new JsonObject();
+        ItemStack invItem = crafter.getInventory().getItem(0);
+        inventory.add("item", stackJson(invItem));
+        inventory.addProperty("has_item", crafter.craftingItemPresent());
+        out.add("inventory", inventory);
+
+        // Cover state
+        try {
+            java.lang.reflect.Field coveredField = com.simibubi.create.content.kinetics.crafter.MechanicalCrafterBlockEntity.class.getDeclaredField("covered");
+            coveredField.setAccessible(true);
+            boolean covered = coveredField.getBoolean(crafter);
+            out.addProperty("covered", covered);
+        } catch (ReflectiveOperationException ignored) {
+        }
+
+        // Connected chain info
+        try {
+            var chain = com.simibubi.create.content.kinetics.crafter.RecipeGridHandler.getAllCraftersOfChain(crafter);
+            if (chain != null) {
+                out.addProperty("chain_size", chain.size());
+                JsonArray chainPositions = new JsonArray();
+                for (var chainCrafter : chain) {
+                    if (chainPositions.size() >= MAX_ARRAY) break;
+                    chainPositions.add(position(chainCrafter.getBlockPos()));
+                }
+                out.add("chain_crafters", chainPositions);
+            } else {
+                out.addProperty("chain_size", 0);
+                out.addProperty("chain_valid", false);
+            }
+        } catch (Exception e) {
+            out.addProperty("chain_error", e.getClass().getSimpleName());
+        }
+
+        // Grouped items (crafting grid)
+        try {
+            java.lang.reflect.Field groupedField = com.simibubi.create.content.kinetics.crafter.MechanicalCrafterBlockEntity.class.getDeclaredField("groupedItems");
+            groupedField.setAccessible(true);
+            Object groupedItems = groupedField.get(crafter);
+            if (groupedItems != null) {
+                java.lang.reflect.Field gridField = groupedItems.getClass().getField("grid");
+                gridField.setAccessible(true);
+                @SuppressWarnings("unchecked")
+                var grid = (java.util.Map<?, ?>) gridField.get(groupedItems);
+                if (grid != null && !grid.isEmpty()) {
+                    JsonArray gridItems = new JsonArray();
+                    for (var entry : grid.entrySet()) {
+                        Object key = entry.getKey();
+                        ItemStack value = (ItemStack) entry.getValue();
+                        if (value.isEmpty()) continue;
+                        JsonObject gridItem = stackJson(value);
+                        try {
+                            java.lang.reflect.Method getLeft = key.getClass().getMethod("getLeft");
+                            java.lang.reflect.Method getRight = key.getClass().getMethod("getRight");
+                            gridItem.addProperty("grid_x", (int) getLeft.invoke(key));
+                            gridItem.addProperty("grid_y", (int) getRight.invoke(key));
+                        } catch (ReflectiveOperationException ignored) {
+                        }
+                        gridItems.add(gridItem);
+                    }
+                    out.add("crafting_grid", gridItems);
+                } else {
+                    out.add("crafting_grid", new JsonArray());
+                }
+
+                // Try to apply recipe
+                try {
+                    ItemStack result = com.simibubi.create.content.kinetics.crafter.RecipeGridHandler.tryToApplyRecipe(level, (com.simibubi.create.content.kinetics.crafter.RecipeGridHandler.GroupedItems) groupedItems);
+                    if (result != null && !result.isEmpty()) {
+                        out.add("recipe_result", stackJson(result));
+                        out.addProperty("recipe_ready", true);
+                    } else {
+                        out.addProperty("recipe_ready", false);
+                        out.addProperty("recipe_result_message", "no matching recipe found");
+                    }
+                } catch (Exception e) {
+                    out.addProperty("recipe_check_error", e.getClass().getSimpleName());
+                }
+            }
+        } catch (ReflectiveOperationException e) {
+            out.addProperty("grid_error", e.getClass().getSimpleName());
+        }
+
+        // Phase description
+        out.addProperty("phase_description", switch (phaseName) {
+            case "IDLE" -> "Waiting for items. Can accept items from hoppers/pipes.";
+            case "ACCEPTING" -> "Activated, item moved to grid. Waiting for preceding crafters.";
+            case "ASSEMBLING" -> "Counting down. Will try to craft or export when done.";
+            case "EXPORTING" -> "Merging grid onto next crafter in chain.";
+            case "WAITING" -> "Export done. Waiting for all preceding crafters to finish.";
+            case "CRAFTING" -> "Recipe found! Crafting in progress.";
+            case "INSERTING" -> "Inserting result into target inventory/belt.";
+            default -> "Unknown phase.";
+        });
+
         return GSON.toJson(out);
     }
 

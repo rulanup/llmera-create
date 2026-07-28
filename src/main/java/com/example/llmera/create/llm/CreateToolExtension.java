@@ -18,14 +18,17 @@ import com.simibubi.create.content.processing.recipe.HeatCondition;
 import com.simibubi.create.content.processing.recipe.ProcessingOutput;
 import com.simibubi.create.content.processing.recipe.ProcessingRecipe;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.Container;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.Ingredient;
 import net.minecraft.world.item.crafting.RecipeHolder;
 import net.minecraft.world.item.crafting.RecipeType;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.ChestBlockEntity;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -53,12 +56,21 @@ public final class CreateToolExtension {
             "create_machine_diagnostics",
             "Read a Create machine through an online bridge or powered machine connector. Reports kinetic stats plus goggle-style information if available.",
             bridgeParameters());
+    private static final ToolDefinition CRAFTER_LOAD = new ToolDefinition(
+            "create_crafter_load",
+            "Transfer items from a container (chest, barrel, etc.) into a Create Mechanical Crafter. The crafter must be in IDLE or ACCEPTING phase. Use this to load ingredients for mechanical crafting recipes.",
+            Map.ofEntries(
+                    Map.entry("source_x", coordinate("container x")), Map.entry("source_y", coordinate("container y")), Map.entry("source_z", coordinate("container z")),
+                    Map.entry("target_x", coordinate("crafter x")), Map.entry("target_y", coordinate("crafter y")), Map.entry("target_z", coordinate("crafter z")),
+                    Map.entry("item_id", Map.of("type", "string", "description", "optional: specific item to take (e.g. 'minecraft:iron_ingot'). If omitted, takes first available item")),
+                    Map.entry("amount", Map.of("type", "integer", "description", "optional: number of items to transfer, default 1"))));
 
     private static final String GUIDANCE = """
             Create integration tools:
               - Use create_kinetics_diagnostics for kinetic state: speed (RPM), stress impact, stress capacity, over-stressed status, and network info.
               - Use create_machine_diagnostics for detailed machine state including goggle-style information.
               - Use create_recipe_lookup for Create recipe types (crushing, milling, mixing, pressing, cutting, splashing, haunting, filling, emptying, deploying, sandpaper_polishing, compacting, mechanical_crafting).
+              - Use create_crafter_load to transfer items from containers (chests, barrels) into Mechanical Crafters for mechanical crafting. Supply source container and target crafter coordinates.
               - A powered machine connector can expose up to 16 linked Create machines. Supply target_x, target_y, and target_z when more than one machine is available.
             """;
 
@@ -69,7 +81,8 @@ public final class CreateToolExtension {
         return new ToolExtension(List.of(
                 new ToolExtension.Tool(KINETICS_DIAGNOSTICS, Set.of(LlmToolMode.BUILD, LlmToolMode.PLAN), CreateToolExtension::execute),
                 new ToolExtension.Tool(MACHINE_DIAGNOSTICS, Set.of(LlmToolMode.BUILD, LlmToolMode.PLAN), CreateToolExtension::execute),
-                new ToolExtension.Tool(RECIPE_LOOKUP, Set.of(LlmToolMode.BUILD, LlmToolMode.PLAN), CreateToolExtension::execute)
+                new ToolExtension.Tool(RECIPE_LOOKUP, Set.of(LlmToolMode.BUILD, LlmToolMode.PLAN), CreateToolExtension::execute),
+                new ToolExtension.Tool(CRAFTER_LOAD, Set.of(LlmToolMode.BUILD), CreateToolExtension::execute)
         ), GUIDANCE);
     }
 
@@ -92,6 +105,7 @@ public final class CreateToolExtension {
             case "create_kinetics_diagnostics" -> kineticsDiagnostics(transmitter, invocation);
             case "create_machine_diagnostics" -> machineDiagnostics(transmitter, invocation);
             case "create_recipe_lookup" -> recipeLookup(transmitter, invocation);
+            case "create_crafter_load" -> crafterLoad(transmitter, invocation);
             default -> error("unknown Create tool: " + invocation.name());
         };
     }
@@ -229,6 +243,106 @@ public final class CreateToolExtension {
         out.add("recipes", recipes);
         out.addProperty("recipe_count", recipes.size());
         out.addProperty("truncated", recipes.size() >= maxRecipes);
+        return GSON.toJson(out);
+    }
+
+    private static String crafterLoad(IntelligentTransmitterBlockEntity transmitter, ToolInvocation invocation) {
+        if (!(transmitter.getLevel() instanceof ServerLevel level)) return error("transmitter level is not a ServerLevel");
+
+        Integer sourceX = integer(invocation.arguments().get("source_x"));
+        Integer sourceY = integer(invocation.arguments().get("source_y"));
+        Integer sourceZ = integer(invocation.arguments().get("source_z"));
+        if (sourceX == null || sourceY == null || sourceZ == null) return error("source_x, source_y, and source_z are required");
+        BlockPos sourcePos = new BlockPos(sourceX, sourceY, sourceZ);
+
+        Integer targetX = integer(invocation.arguments().get("target_x"));
+        Integer targetY = integer(invocation.arguments().get("target_y"));
+        Integer targetZ = integer(invocation.arguments().get("target_z"));
+        if (targetX == null || targetY == null || targetZ == null) return error("target_x, target_y, and target_z are required");
+        BlockPos targetPos = new BlockPos(targetX, targetY, targetZ);
+
+        if (!level.hasChunkAt(sourcePos)) return error("source position is not loaded");
+        if (!level.hasChunkAt(targetPos)) return error("target position is not loaded");
+
+        BlockEntity sourceBE = level.getBlockEntity(sourcePos);
+        if (!(sourceBE instanceof Container sourceContainer)) return error("source is not a container");
+
+        BlockEntity targetBE = level.getBlockEntity(targetPos);
+        if (!(targetBE instanceof com.simibubi.create.content.kinetics.crafter.MechanicalCrafterBlockEntity crafter)) {
+            return error("target is not a Mechanical Crafter");
+        }
+
+        String phase = crafter.getPhase().toString();
+        if (!phase.equals("IDLE") && !phase.equals("ACCEPTING")) {
+            return error("crafter is not ready (phase: " + phase + "). Must be IDLE or ACCEPTING");
+        }
+
+        String itemId = stringArg(invocation, "item_id");
+        int amount = clamp(intArg(invocation, "amount", 1), 1, 64);
+
+        ItemStack targetItem = ItemStack.EMPTY;
+        if (itemId != null && !itemId.isEmpty()) {
+            ResourceLocation itemRL = ResourceLocation.tryParse(itemId);
+            if (itemRL == null) return error("invalid item_id: " + itemId);
+            var itemHolder = BuiltInRegistries.ITEM.get(itemRL);
+            if (itemHolder.isPresent()) {
+                targetItem = new ItemStack(itemHolder.get(), amount);
+            } else {
+                return error("item not found: " + itemId);
+            }
+        }
+
+        ItemStack taken = ItemStack.EMPTY;
+        int transferred = 0;
+
+        if (sourceBE instanceof ChestBlockEntity) {
+            com.google.common.base.Preconditions.checkNotNull(sourceBE);
+        }
+
+        for (int i = 0; i < sourceContainer.getContainerSize(); i++) {
+            ItemStack slot = sourceContainer.getItem(i);
+            if (slot.isEmpty()) continue;
+
+            if (!targetItem.isEmpty()) {
+                if (!ItemStack.isSameItemSameComponents(slot, targetItem)) continue;
+            }
+
+            int toTake = Math.min(slot.getCount(), amount - transferred);
+            if (toTake <= 0) continue;
+
+            ItemStack extracted = slot.split(toTake);
+            sourceContainer.setChanged();
+
+            ItemStack remainder = crafter.getInventory().insertItem(0, extracted, false);
+            crafter.setChanged();
+
+            if (!remainder.isEmpty()) {
+                slot.grow(remainder.getCount());
+                sourceContainer.setChanged();
+            }
+
+            if (taken.isEmpty()) {
+                taken = extracted.copy();
+                taken.setCount(extracted.getCount() - remainder.getCount());
+            } else {
+                taken.grow(extracted.getCount() - remainder.getCount());
+            }
+
+            transferred += extracted.getCount() - remainder.getCount();
+            if (transferred >= amount) break;
+        }
+
+        JsonObject out = base("create_crafter_load");
+        out.add("source", position(sourcePos));
+        out.add("target", position(targetPos));
+        out.addProperty("crafter_phase", phase);
+        if (taken.isEmpty()) {
+            out.addProperty("transferred", 0);
+            out.addProperty("message", "no matching items found in source container");
+        } else {
+            out.add("item", stackJson(taken));
+            out.addProperty("transferred", transferred);
+        }
         return GSON.toJson(out);
     }
 
